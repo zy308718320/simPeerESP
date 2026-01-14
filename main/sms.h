@@ -73,6 +73,14 @@ bool sms_delete(int index);
  */
 bool sms_delete_all(void);
 
+/**
+ * @brief 获取本机号码（从SIM卡读取）
+ * @param phone_number 存储号码的缓冲区
+ * @param buf_size 缓冲区大小
+ * @return true: 获取成功, false: 失败（SIM卡可能未存储号码）
+ */
+bool sms_get_own_number(char *phone_number, size_t buf_size);
+
 #ifdef __cplusplus
 }
 #endif
