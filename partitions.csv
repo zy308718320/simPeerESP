@@ -1,5 +1,8 @@
 # Name,   Type, SubType, Offset,  Size, Flags
-# Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
+# OTA 双分区布局：升级写入备用分区，成功后才切换，失败不影响运行中的固件
+# nvs 位置与大小保持不变，升级分区表后 WiFi 配置等数据不会丢失
+# （RF 校准数据存于 NVS，无需单独的 phy_init 分区）
 nvs,      data, nvs,     0x9000,  0x6000,
-phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000, 0x200000,
+otadata,  data, ota,     0xf000,  0x2000,
+ota_0,    app,  ota_0,   0x20000, 0x1F0000,
+ota_1,    app,  ota_1,   0x210000, 0x1F0000,

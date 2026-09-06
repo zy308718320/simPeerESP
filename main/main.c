@@ -25,9 +25,11 @@
 #include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_sntp.h"
+#include "esp_app_desc.h"
 #include "sms.h"
 #include "wifi_smartconfig.h"
 #include "feishu_api.h"
+#include "ota_update.h"
 
 static const char *TAG = "MAIN";
 
@@ -381,8 +383,9 @@ static void main_task(void *arg)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "ESP32-S3 + A7670E 短信转发器");
-    ESP_LOGI(TAG, "功能: SmartConfig 配网 + 短信接收 + 飞书通知");
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    ESP_LOGI(TAG, "ESP32-S3 + A7670E 短信转发器 v%s", app_desc->version);
+    ESP_LOGI(TAG, "功能: SmartConfig 配网 + 短信接收 + 飞书通知 + OTA");
     ESP_LOGI(TAG, "=====================================");
 
     // 创建短信事件队列（接收任务 -> 转发任务）
@@ -397,4 +400,7 @@ void app_main(void)
 
     // 创建飞书转发任务（大栈，承载 HTTPS/TLS）
     xTaskCreate(sms_forward_task, "sms_forward", FORWARD_TASK_STACK_SIZE, NULL, 4, NULL);
+
+    // 启动 OTA 更新检查任务（启动 2 分钟后首查，每 24 小时一次）
+    ota_start_task();
 }

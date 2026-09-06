@@ -1,5 +1,5 @@
-idf_component_register(SRCS "feishu_api.c" "wifi_smartconfig.c" "main.c" "sms.c"
-                       PRIV_REQUIRES esp_driver_uart esp_driver_gpio nvs_flash esp_wifi esp_netif esp_http_client esp_event mbedtls lwip
+idf_component_register(SRCS "feishu_api.c" "ota_update.c" "wifi_smartconfig.c" "main.c" "sms.c"
+                       PRIV_REQUIRES esp_driver_uart esp_driver_gpio nvs_flash esp_wifi esp_netif esp_http_client esp_event mbedtls lwip esp_https_ota esp_app_format app_update
                        INCLUDE_DIRS ".")
 
 # 敏感配置检查：secrets.h 不入库，缺少时给出明确提示
