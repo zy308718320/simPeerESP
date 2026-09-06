@@ -29,7 +29,18 @@ fi
 if [ ! -f build/partition_table/partition-table.bin ]; then
     rm -rf build
 fi
-. "${HOME}/.espressif/tools/activate_idf_v6.1.sh" >/dev/null
+# EIM 激活脚本只支持 zsh 下 source，bash 环境用 -e 参数输出 KEY=VALUE 环境变量
+# 注意：其中 PATH 是不含系统路径的纯工具链路径，直接导入会丢失系统命令，
+# 跳过后手动组合（idf.py 所需目录 + venv + 工具链 + 原系统 PATH）
+eim_path=""
+while IFS='=' read -r key value; do
+    if [ "$key" = "PATH" ]; then
+        eim_path="$value"
+        continue
+    fi
+    [ -n "$key" ] && export "${key}=${value}"
+done < <("${HOME}/.espressif/tools/activate_idf_v6.1.sh" -e)
+export PATH="${IDF_PATH}/tools:${IDF_PYTHON_ENV_PATH}/bin:${eim_path}:${PATH}"
 idf.py build
 
 # 3. 发布 Release
