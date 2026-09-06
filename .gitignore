@@ -11,6 +11,9 @@ stats.html
 .env.local
 .env.*.local
 
+# 敏感配置（模板见 main/secrets.h.example）
+main/secrets.h
+
 # Log files
 npm-debug.log*
 yarn-debug.log*

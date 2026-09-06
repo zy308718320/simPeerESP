@@ -1,8 +1,8 @@
 /**
  * @file sms.h
- * @brief A7670E 短信模块接口定义
- * 
- * 提供短信发送和接收功能的接口
+ * @brief A7670E 短信接收模块接口定义
+ *
+ * 提供短信接收监听功能
  */
 
 #ifndef __SMS_H__
@@ -30,14 +30,6 @@ typedef void (*sms_receive_callback_t)(const char *phone_number, const char *mes
 bool sms_init(void);
 
 /**
- * @brief 发送短信（自动识别中英文）
- * @param phone_number 目标电话号码
- * @param message 短信内容（支持中英文，UTF-8编码）
- * @return true: 发送成功, false: 失败
- */
-bool sms_send(const char *phone_number, const char *message);
-
-/**
  * @brief 注册短信接收回调函数
  * @param callback 回调函数，当收到新短信时调用
  */
@@ -53,19 +45,6 @@ void sms_start_receive_task(void);
  * @brief 停止短信接收监听任务
  */
 void sms_stop_receive_task(void);
-
-/**
- * @brief 读取所有未读短信
- * @return 读取到的短信数量
- */
-int sms_read_all_unread(void);
-
-/**
- * @brief 删除指定索引的短信
- * @param index 短信索引
- * @return true: 删除成功, false: 失败
- */
-bool sms_delete(int index);
 
 /**
  * @brief 删除所有短信

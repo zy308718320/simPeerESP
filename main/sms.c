@@ -1,8 +1,8 @@
 /**
  * @file sms.c
- * @brief A7670E 短信模块实现
- * 
- * 实现短信发送和接收功能
+ * @brief A7670E 短信接收模块实现
+ *
+ * 实现短信接收监听功能
  */
 
 #include <stdio.h>
@@ -30,7 +30,6 @@ static const char *TAG = "SMS";
 
 // 超时时间（毫秒）
 #define AT_CMD_TIMEOUT_MS       5000
-#define SMS_SEND_TIMEOUT_MS     30000
 
 // 短信接收任务句柄
 static TaskHandle_t s_sms_receive_task_handle = NULL;
@@ -40,9 +39,6 @@ static sms_receive_callback_t s_sms_receive_callback = NULL;
 
 // 任务运行标志
 static volatile bool s_receive_task_running = false;
-
-// 发送中标志（暂停接收任务读取）
-static volatile bool s_sending_sms = false;
 
 /**
  * @brief 初始化A7670E UART通信
@@ -181,83 +177,6 @@ static bool a7670e_send_at_cmd(const char *cmd, const char *expected_response,
 }
 
 /**
- * @brief 发送短信内容
- */
-static bool a7670e_send_sms_content(const char *content, uint32_t timeout_ms)
-{
-    char response[256];
-    
-    a7670e_uart_write_slow(content, strlen(content));
-    
-    char ctrl_z = 0x1A;
-    uart_write_bytes(A7670E_UART_NUM, &ctrl_z, 1);
-    
-    ESP_LOGI(TAG, "发送短信内容: %s", content);
-    
-    memset(response, 0, sizeof(response));
-    int total_len = 0;
-    uint32_t start_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    
-    while ((xTaskGetTickCount() * portTICK_PERIOD_MS - start_time) < timeout_ms) {
-        int len = uart_read_bytes(A7670E_UART_NUM, (uint8_t*)(response + total_len), 
-                                   sizeof(response) - total_len - 1, pdMS_TO_TICKS(100));
-        if (len > 0) {
-            total_len += len;
-            response[total_len] = '\0';
-            
-            if (strstr(response, "OK") || strstr(response, "+CMGS:")) {
-                ESP_LOGI(TAG, "短信发送成功: %s", response);
-                return true;
-            }
-            if (strstr(response, "ERROR")) {
-                ESP_LOGE(TAG, "短信发送失败: %s", response);
-                return false;
-            }
-        }
-    }
-    
-    ESP_LOGW(TAG, "短信发送超时");
-    return false;
-}
-
-/**
- * @brief UTF-8转UCS2编码
- */
-static int utf8_to_ucs2_hex(const char *utf8_str, char *ucs2_buf, size_t buf_size)
-{
-    int out_len = 0;
-    const unsigned char *p = (const unsigned char *)utf8_str;
-    
-    while (*p && out_len < (int)(buf_size - 5)) {
-        uint32_t unicode = 0;
-        
-        if ((*p & 0x80) == 0) {
-            unicode = *p;
-            p++;
-        } else if ((*p & 0xE0) == 0xC0) {
-            unicode = (*p & 0x1F) << 6;
-            p++;
-            unicode |= (*p & 0x3F);
-            p++;
-        } else if ((*p & 0xF0) == 0xE0) {
-            unicode = (*p & 0x0F) << 12;
-            p++;
-            unicode |= (*p & 0x3F) << 6;
-            p++;
-            unicode |= (*p & 0x3F);
-            p++;
-        } else {
-            p++;
-            continue;
-        }
-        
-        out_len += snprintf(ucs2_buf + out_len, buf_size - out_len, "%04X", (unsigned int)unicode);
-    }
-    
-    return out_len;
-}
-
-/**
  * @brief UCS2编码转UTF-8
  */
 static int ucs2_hex_to_utf8(const char *ucs2_str, char *utf8_buf, size_t buf_size)
@@ -289,21 +208,6 @@ static int ucs2_hex_to_utf8(const char *ucs2_str, char *utf8_buf, size_t buf_siz
     
     utf8_buf[out_len] = '\0';
     return out_len;
-}
-
-/**
- * @brief 检测是否只包含ASCII字符
- */
-static bool is_ascii_only(const char *str)
-{
-    const unsigned char *p = (const unsigned char *)str;
-    while (*p) {
-        if (*p & 0x80) {
-            return false;
-        }
-        p++;
-    }
-    return true;
 }
 
 /**
@@ -347,14 +251,29 @@ static bool a7670e_module_init(void)
     
     // 查询信号强度
     a7670e_send_at_cmd("AT+CSQ", "OK", response, sizeof(response), AT_CMD_TIMEOUT_MS);
-    
+
+    // 强制设置全功能模式（确保射频开启，部分场景模块可能处于 CFUN=0 最小功能模式）
+    ESP_LOGI(TAG, "设置全功能模式 (AT+CFUN=1)...");
+    if (!a7670e_send_at_cmd("AT+CFUN=1", "OK", response, sizeof(response), 10000)) {
+        ESP_LOGW(TAG, "设置 CFUN=1 失败: %s", response);
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));    // 等待射频电路就绪
+
     // 查询网络注册状态
+    // 响应格式 +CREG: <n>,<stat>，stat: 0未注册未搜索 1已注册 2搜索中 3拒绝 5漫游
     ESP_LOGI(TAG, "检查网络注册状态...");
     for (int i = 0; i < 30; i++) {
-        if (a7670e_send_at_cmd("AT+CREG?", "+CREG: 0,1", response, sizeof(response), AT_CMD_TIMEOUT_MS) ||
-            a7670e_send_at_cmd("AT+CREG?", "+CREG: 0,5", response, sizeof(response), AT_CMD_TIMEOUT_MS)) {
-            ESP_LOGI(TAG, "网络注册成功");
-            break;
+        if (a7670e_send_at_cmd("AT+CREG?", "+CREG:", response, sizeof(response), AT_CMD_TIMEOUT_MS)) {
+            char *p = strstr(response, "+CREG:");
+            p = strchr(p, ',');
+            int stat = p ? atoi(p + 1) : -1;
+
+            if (stat == 1 || stat == 5) {
+                ESP_LOGI(TAG, "网络注册成功 (stat=%d)", stat);
+                break;
+            }
+            ESP_LOGI(TAG, "网络未注册 (stat=%d: %s)，继续等待...", stat,
+                     stat == 0 ? "未搜索" : stat == 2 ? "搜索中" : stat == 3 ? "被网络拒绝" : "未知");
         }
         if (i == 29) {
             ESP_LOGW(TAG, "网络注册超时，继续尝试");
@@ -400,57 +319,43 @@ static int parse_cmti_index(const char *cmti_str)
 }
 
 /**
- * @brief 解析短信响应的通用函数（支持 +CMGR 和 +CMGL 格式）
+ * @brief 解析 +CMGR 读短信响应
  * @param response 响应字符串
  * @param phone_number 输出：发送方号码
  * @param message 输出：短信内容
  * @param timestamp 输出：时间戳
- * @param is_ucs2 是否为UCS2编码（保留参数，当前不使用）
- * @param header_type 头部类型："CMGR" 或 "CMGL"
  */
-static void parse_sms_response(const char *response, char *phone_number, 
-                                char *message, char *timestamp, bool is_ucs2,
-                                const char *header_type)
+static void parse_cmgr_sms(const char *response, char *phone_number,
+                            char *message, char *timestamp)
 {
-    (void)is_ucs2;  // 暂不使用
-    
     // +CMGR 格式: +CMGR: "REC UNREAD","+8613800138000","","25/01/01,12:00:00+32"\r\n短信内容\r\n\r\nOK
-    // +CMGL 格式: +CMGL: 46,"REC UNREAD","1068498223740985","","26/01/13,22:50:38+32"\r\n短信内容
-    
-    char search_str[16];
-    snprintf(search_str, sizeof(search_str), "+%s:", header_type);
-    
-    const char *p = strstr(response, search_str);
+
+    const char *p = strstr(response, "+CMGR:");
     if (!p) return;
-    
-    ESP_LOGI(TAG, "解析%s响应: %.200s...", header_type, response);
-    
+
+    ESP_LOGI(TAG, "解析CMGR响应: %.200s...", response);
+
     // 提取电话号码
-    // +CMGR 格式: +CMGR: "状态","电话号码","","时间戳"
-    // +CMGL 格式: +CMGL: 索引,"状态","电话号码","","时间戳"
-    // 所以 CMGL 比 CMGR 多一个引号对在电话号码前面
-    
-    // CMGR 格式: +CMGR: "状态","电话号码","","时间戳"  - 电话号码在第2个引号对
-    // CMGL 格式: +CMGL: 索引,"状态","电话号码","","时间戳" - 电话号码在第3个引号对
-    // 
+    // +CMGR 格式: +CMGR: "状态","电话号码","","时间戳"  - 电话号码在第2个引号对
+    //
     // 策略：遍历所有引号对，找到第一个看起来像电话号码的内容（数字、+号开头）
-    
+
     phone_number[0] = '\0';  // 默认为空
-    
+
     const char *quote = strchr(p, '"');
     int quote_pair = 0;
-    
+
     while (quote && quote_pair < 5) {
         const char *q_start = quote + 1;
         const char *q_end = strchr(q_start, '"');
-        
+
         if (!q_end) break;
-        
+
         size_t len = q_end - q_start;
         quote_pair++;
-        
+
         ESP_LOGD(TAG, "引号对%d: [%.*s]", quote_pair, (int)len, q_start);
-        
+
         // 检查是否像电话号码：
         // 1. 长度 > 0 且 < 32
         // 2. 以数字或+开头
@@ -465,15 +370,15 @@ static void parse_sms_response(const char *response, char *phone_number,
                 break;
             }
         }
-        
+
         // 继续下一个引号对
         quote = strchr(q_end + 1, '"');
     }
-    
+
     if (phone_number[0] == '\0') {
         ESP_LOGW(TAG, "未找到有效电话号码");
     }
-    
+
     // 提取时间戳（最后一个引号对之间的内容）
     const char *time_end = strrchr(p, '"');
     if (time_end && time_end > p) {
@@ -488,15 +393,15 @@ static void parse_sms_response(const char *response, char *phone_number,
             }
         }
     }
-    
+
     // 提取短信内容（在第一个\r\n之后）
     const char *content_start = strchr(p, '\n');
     if (content_start) {
         content_start++;
-        
+
         // 跳过可能的\r
         if (*content_start == '\r') content_start++;
-        
+
         // 查找内容结束位置
         const char *content_end = strstr(content_start, "\r\n\r\nOK");
         if (!content_end) {
@@ -505,22 +410,15 @@ static void parse_sms_response(const char *response, char *phone_number,
         if (!content_end) {
             content_end = strstr(content_start, "\nOK");
         }
-        // 对于 CMGL 格式，下一条短信以 +CMGL: 开头
-        if (!content_end) {
-            content_end = strstr(content_start, "\r\n+CMGL:");
-        }
-        if (!content_end) {
-            content_end = strstr(content_start, "\n+CMGL:");
-        }
         if (!content_end) {
             content_end = content_start + strlen(content_start);
         }
-        
+
         // 去除末尾的\r\n
         while (content_end > content_start && (*(content_end-1) == '\r' || *(content_end-1) == '\n')) {
             content_end--;
         }
-        
+
         if (content_end > content_start) {
             size_t len = content_end - content_start;
             if (len > 511) len = 511;
@@ -529,24 +427,6 @@ static void parse_sms_response(const char *response, char *phone_number,
             ESP_LOGI(TAG, "解析到短信内容(原始): [%s]", message);
         }
     }
-}
-
-/**
- * @brief 解析+CMGR响应（兼容旧接口）
- */
-static void parse_cmgr_response(const char *cmgr_response, char *phone_number, 
-                                 char *message, char *timestamp, bool is_ucs2)
-{
-    parse_sms_response(cmgr_response, phone_number, message, timestamp, is_ucs2, "CMGR");
-}
-
-/**
- * @brief 解析+CMGL响应
- */
-static void parse_cmgl_response(const char *cmgl_response, char *phone_number, 
-                                 char *message, char *timestamp, bool is_ucs2)
-{
-    parse_sms_response(cmgl_response, phone_number, message, timestamp, is_ucs2, "CMGL");
 }
 
 /**
@@ -566,6 +446,9 @@ static bool is_ucs2_encoded(const char *str)
     return true;
 }
 
+// 前向声明（读取并处理完短信后立即删除，释放SIM卡空间）
+static bool sms_delete(int index);
+
 /**
  * @brief 读取指定索引的短信
  * @param index 短信索引
@@ -574,10 +457,14 @@ static bool is_ucs2_encoded(const char *str)
 static bool read_sms_by_index(int index)
 {
     char cmd[32];
-    char response[1024];  // 增大缓冲区以容纳中文
-    char phone_number[64] = {0};
-    char message[512] = {0};
-    char timestamp[32] = {0};
+    /* 大缓冲使用 static 存储以降低任务栈压力
+     * （本函数仅被短信接收任务调用，单线程访问，无并发问题） */
+    static char response[1024];    // 增大缓冲区以容纳中文
+    static char phone_number[64];
+    static char message[512];
+    static char timestamp[32];
+
+    response[0] = phone_number[0] = message[0] = timestamp[0] = '\0';
     
     // 确保使用文本模式
     a7670e_send_at_cmd("AT+CMGF=1", "OK", response, sizeof(response), AT_CMD_TIMEOUT_MS);
@@ -589,18 +476,20 @@ static bool read_sms_by_index(int index)
     
     if (a7670e_send_at_cmd(cmd, "OK", response, sizeof(response), AT_CMD_TIMEOUT_MS)) {
         // 解析响应
-        parse_cmgr_response(response, phone_number, message, timestamp, true);
-        
-        // 如果电话号码是UCS2编码，转换为UTF-8
+        parse_cmgr_sms(response, phone_number, message, timestamp);
+
+        // 如果电话号码是UCS2编码，转换为UTF-8（static缓冲，降低栈压力）
+        static char phone_utf8[64];
+        static char message_utf8[512];
         if (is_ucs2_encoded(phone_number)) {
-            char phone_utf8[64] = {0};
+            memset(phone_utf8, 0, sizeof(phone_utf8));
             ucs2_hex_to_utf8(phone_number, phone_utf8, sizeof(phone_utf8));
             strncpy(phone_number, phone_utf8, sizeof(phone_number) - 1);
         }
-        
+
         // 如果消息是UCS2编码，转换为UTF-8
         if (is_ucs2_encoded(message)) {
-            char message_utf8[512] = {0};
+            memset(message_utf8, 0, sizeof(message_utf8));
             ucs2_hex_to_utf8(message, message_utf8, sizeof(message_utf8));
             strncpy(message, message_utf8, sizeof(message) - 1);
         }
@@ -628,9 +517,6 @@ static bool read_sms_by_index(int index)
     return false;
 }
 
-// 前向声明
-static bool process_single_cmgl_sms(const char *cmgl_start, const char *next_cmgl, int *out_index);
-
 /**
  * @brief 短信接收监听任务
  */
@@ -638,30 +524,24 @@ static void sms_receive_task(void *arg)
 {
     // 使用静态缓冲区避免栈溢出
     static char buffer[2048];
-    static int processed_indices[50];
     int buf_index = 0;
-    
+
     memset(buffer, 0, sizeof(buffer));
-    
+
     ESP_LOGI(TAG, "短信接收监听任务启动");
-    
+
     while (s_receive_task_running) {
-        // 如果正在发送短信，暂停读取
-        if (s_sending_sms) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-        
         // 读取UART数据
-        int len = uart_read_bytes(A7670E_UART_NUM, (uint8_t*)(buffer + buf_index), 
+        int len = uart_read_bytes(A7670E_UART_NUM, (uint8_t*)(buffer + buf_index),
                                    sizeof(buffer) - buf_index - 1, pdMS_TO_TICKS(100));
-        
+
         if (len > 0) {
             buf_index += len;
             buffer[buf_index] = '\0';
-            
-            ESP_LOGI(TAG, "收到响应: \n%s", buffer);
-            
+
+            /* 串口原始数据降为调试日志，避免频繁大块打印拖慢接收任务 */
+            ESP_LOGD(TAG, "收到响应: \n%s", buffer);
+
             // 检查是否收到新短信通知 +CMTI
             char *cmti = strstr(buffer, "+CMTI:");
             if (cmti) {
@@ -669,72 +549,28 @@ static void sms_receive_task(void *arg)
                 char *cmti_end = strstr(cmti, "\r\n");
                 if (cmti_end) {
                     *cmti_end = '\0';
-                    
+
                     int sms_index = parse_cmti_index(cmti);
                     if (sms_index >= 0) {
                         ESP_LOGI(TAG, "收到新短信通知，索引: %d", sms_index);
-                        
+
                         // 恢复字符串
                         *cmti_end = '\r';
-                        
+
                         // 稍等一下让模块准备好
                         vTaskDelay(pdMS_TO_TICKS(500));
-                        
+
                         // 读取短信
                         read_sms_by_index(sms_index);
                     }
-                    
+
                     // 清空缓冲区
                     buf_index = 0;
                     memset(buffer, 0, sizeof(buffer));
                     continue;
                 }
             }
-            
-            // 检查是否直接收到 +CMGL 格式的短信列表
-            char *cmgl = strstr(buffer, "+CMGL:");
-            if (cmgl) {
-                // 等待接收完整的响应（检查是否有OK结束符或超时）
-                // 如果已经收到OK或者缓冲区足够大，开始解析
-                if (strstr(buffer, "\r\nOK") || buf_index > 1500) {
-                    ESP_LOGI(TAG, "处理CMGL响应...");
-                    
-                    // 使用静态数组记录已处理短信的索引用于删除
-                    int processed_count = 0;
-                    memset(processed_indices, 0, sizeof(processed_indices));
-                    
-                    // 解析所有短信
-                    char *p = buffer;
-                    while ((p = strstr(p, "+CMGL:")) != NULL) {
-                        char *next = strstr(p + 6, "+CMGL:");
-                        int sms_idx = -1;
-                        if (process_single_cmgl_sms(p, next, &sms_idx)) {
-                            if (sms_idx >= 0 && processed_count < 50) {
-                                processed_indices[processed_count++] = sms_idx;
-                            }
-                        }
-                        if (next) {
-                            p = next;
-                        } else {
-                            break;
-                        }
-                    }
-                    
-                    // 删除已处理的短信
-                    if (processed_count > 0) {
-                        ESP_LOGI(TAG, "删除 %d 条已处理的短信...", processed_count);
-                        for (int i = 0; i < processed_count; i++) {
-                            sms_delete(processed_indices[i]);
-                        }
-                    }
-                    
-                    // 清空缓冲区
-                    buf_index = 0;
-                    memset(buffer, 0, sizeof(buffer));
-                    continue;
-                }
-            }
-            
+
             // 防止缓冲区溢出
             if (buf_index > 1800) {
                 ESP_LOGW(TAG, "缓冲区接近满，清空");
@@ -742,10 +578,10 @@ static void sms_receive_task(void *arg)
                 memset(buffer, 0, sizeof(buffer));
             }
         }
-        
+
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    
+
     ESP_LOGI(TAG, "短信接收监听任务退出");
     s_sms_receive_task_handle = NULL;
     vTaskDelete(NULL);
@@ -772,113 +608,6 @@ bool sms_init(void)
     return a7670e_module_init();
 }
 
-bool sms_send(const char *phone_number, const char *message)
-{
-    char cmd[128];
-    char response[256];
-    bool result = false;
-    
-    // 设置发送标志，暂停接收任务
-    s_sending_sms = true;
-    vTaskDelay(pdMS_TO_TICKS(200));  // 等待接收任务暂停
-    
-    // 清空UART缓冲区
-    uart_flush(A7670E_UART_NUM);
-    
-    ESP_LOGI(TAG, "准备发送短信到: %s", phone_number);
-    ESP_LOGI(TAG, "短信内容: %s", message);
-    
-    // 检测消息是否包含非ASCII字符
-    bool use_ucs2 = !is_ascii_only(message);
-    
-    if (use_ucs2) {
-        ESP_LOGI(TAG, "检测到非ASCII字符，使用UCS2编码发送");
-    } else {
-        ESP_LOGI(TAG, "纯ASCII字符，使用GSM编码发送");
-    }
-    
-    // 设置短信格式为文本模式
-    if (!a7670e_send_at_cmd("AT+CMGF=1", "OK", response, sizeof(response), AT_CMD_TIMEOUT_MS)) {
-        ESP_LOGE(TAG, "设置文本模式失败");
-        return false;
-    }
-    
-    if (use_ucs2) {
-        if (!a7670e_send_at_cmd("AT+CSCS=\"UCS2\"", "OK", response, sizeof(response), AT_CMD_TIMEOUT_MS)) {
-            ESP_LOGE(TAG, "设置UCS2字符集失败");
-            s_sending_sms = false;
-            return false;
-        }
-        
-        // 设置文本模式参数：dcs=8表示UCS2编码
-        a7670e_send_at_cmd("AT+CSMP=17,167,0,8", "OK", response, sizeof(response), AT_CMD_TIMEOUT_MS);
-    } else {
-        if (!a7670e_send_at_cmd("AT+CSCS=\"GSM\"", "OK", response, sizeof(response), AT_CMD_TIMEOUT_MS)) {
-            ESP_LOGE(TAG, "设置GSM字符集失败");
-            s_sending_sms = false;
-            return false;
-        }
-    }
-    
-    // 准备电话号码和短信内容
-    char phone_to_send[64];
-    char message_to_send[512];
-    
-    if (use_ucs2) {
-        utf8_to_ucs2_hex(phone_number, phone_to_send, sizeof(phone_to_send));
-        utf8_to_ucs2_hex(message, message_to_send, sizeof(message_to_send));
-    } else {
-        strncpy(phone_to_send, phone_number, sizeof(phone_to_send) - 1);
-        phone_to_send[sizeof(phone_to_send) - 1] = '\0';
-        strncpy(message_to_send, message, sizeof(message_to_send) - 1);
-        message_to_send[sizeof(message_to_send) - 1] = '\0';
-    }
-    
-    // 发送AT+CMGS命令
-    snprintf(cmd, sizeof(cmd), "AT+CMGS=\"%s\"", phone_to_send);
-    
-    uart_flush(A7670E_UART_NUM);
-    
-    ESP_LOGI(TAG, "发送: %s", cmd);
-    a7670e_send_serial(cmd);
-    
-    // 等待">"提示符
-    memset(response, 0, sizeof(response));
-    int total_len = 0;
-    uint32_t start_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    
-    while ((xTaskGetTickCount() * portTICK_PERIOD_MS - start_time) < AT_CMD_TIMEOUT_MS) {
-        int len = uart_read_bytes(A7670E_UART_NUM, (uint8_t*)(response + total_len), 
-                                   sizeof(response) - total_len - 1, pdMS_TO_TICKS(100));
-        if (len > 0) {
-            total_len += len;
-            response[total_len] = '\0';
-            
-            if (strstr(response, ">")) {
-                ESP_LOGI(TAG, "收到>提示符，开始输入短信内容");
-                break;
-            }
-            if (strstr(response, "ERROR")) {
-                ESP_LOGE(TAG, "发送失败: %s", response);
-                return false;
-            }
-        }
-    }
-    
-    if (!strstr(response, ">")) {
-        ESP_LOGE(TAG, "未收到>提示符");
-        s_sending_sms = false;
-        return false;
-    }
-    
-    result = a7670e_send_sms_content(message_to_send, SMS_SEND_TIMEOUT_MS);
-    
-    // 恢复接收任务
-    s_sending_sms = false;
-    
-    return result;
-}
-
 void sms_register_receive_callback(sms_receive_callback_t callback)
 {
     s_sms_receive_callback = callback;
@@ -893,7 +622,7 @@ void sms_start_receive_task(void)
     }
     
     s_receive_task_running = true;
-xTaskCreate(sms_receive_task, "sms_receive", 8192, NULL, 5, &s_sms_receive_task_handle);
+    xTaskCreate(sms_receive_task, "sms_receive", 8192, NULL, 5, &s_sms_receive_task_handle);
 }
 
 void sms_stop_receive_task(void)
@@ -908,123 +637,9 @@ void sms_stop_receive_task(void)
 }
 
 /**
- * @brief 处理单条 CMGL 格式的短信
- * @param cmgl_start 指向 +CMGL: 开头的字符串
- * @param next_cmgl 下一条 +CMGL: 的位置（用于确定内容边界）
- * @param out_index 输出短信索引（用于后续删除）
- * @return true 如果处理成功
+ * @brief 删除指定索引的短信（内部使用）
  */
-static bool process_single_cmgl_sms(const char *cmgl_start, const char *next_cmgl, int *out_index)
-{
-    char phone_number[64] = {0};
-    char message[512] = {0};
-    char timestamp[32] = {0};
-    
-    // 提取短信索引
-    // +CMGL: 46,"REC UNREAD",...
-    int sms_index = -1;
-    if (sscanf(cmgl_start, "+CMGL: %d", &sms_index) == 1) {
-        if (out_index) {
-            *out_index = sms_index;
-        }
-    }
-    
-    // 创建临时缓冲区存储这条短信的完整内容
-    size_t len = next_cmgl ? (size_t)(next_cmgl - cmgl_start) : strlen(cmgl_start);
-    if (len > 1023) len = 1023;
-    
-    char temp_buf[1024];
-    strncpy(temp_buf, cmgl_start, len);
-    temp_buf[len] = '\0';
-    
-    // 解析短信
-    parse_cmgl_response(temp_buf, phone_number, message, timestamp, true);
-    
-    // 如果电话号码是UCS2编码，转换为UTF-8
-    if (is_ucs2_encoded(phone_number)) {
-        char phone_utf8[64] = {0};
-        ucs2_hex_to_utf8(phone_number, phone_utf8, sizeof(phone_utf8));
-        strncpy(phone_number, phone_utf8, sizeof(phone_number) - 1);
-    }
-    
-    // 如果消息是UCS2编码，转换为UTF-8
-    if (is_ucs2_encoded(message)) {
-        char message_utf8[512] = {0};
-        ucs2_hex_to_utf8(message, message_utf8, sizeof(message_utf8));
-        strncpy(message, message_utf8, sizeof(message) - 1);
-    }
-    
-    // 调用回调函数
-    if (s_sms_receive_callback && strlen(message) > 0) {
-        ESP_LOGI(TAG, "收到短信 [索引:%d] - 发送方: %s, 时间: %s", sms_index, phone_number, timestamp);
-        ESP_LOGI(TAG, "短信内容: %s", message);
-        s_sms_receive_callback(phone_number, message, timestamp);
-        return true;
-    }
-    
-    return false;
-}
-
-int sms_read_all_unread(void)
-{
-    char response[2048];  // 增大缓冲区
-    int count = 0;
-    int processed_indices[50];  // 存储已处理短信的索引，最多50条
-    int processed_count = 0;
-    
-    // 读取所有未读短信
-    // AT+CMGL="REC UNREAD" 列出所有未读短信
-    ESP_LOGI(TAG, "读取所有未读短信...");
-    
-    // 确保使用文本模式
-    a7670e_send_at_cmd("AT+CMGF=1", "OK", response, sizeof(response), AT_CMD_TIMEOUT_MS);
-    
-    // 使用UCS2编码读取（可以正确显示中文）
-    a7670e_send_at_cmd("AT+CSCS=\"UCS2\"", "OK", response, sizeof(response), AT_CMD_TIMEOUT_MS);
-    
-    if (a7670e_send_at_cmd("AT+CMGL=\"REC UNREAD\"", "OK", response, sizeof(response), 10000)) {
-        ESP_LOGI(TAG, "CMGL响应长度: %d", strlen(response));
-        
-        // 解析响应，查找所有+CMGL:开头的行并直接解析内容
-        char *p = response;
-        while ((p = strstr(p, "+CMGL:")) != NULL) {
-            // 找到下一条短信的位置
-            char *next = strstr(p + 6, "+CMGL:");
-            
-            // 处理这条短信
-            int sms_index = -1;
-            if (process_single_cmgl_sms(p, next, &sms_index)) {
-                count++;
-                // 记录已处理的短信索引
-                if (sms_index >= 0 && processed_count < 50) {
-                    processed_indices[processed_count++] = sms_index;
-                }
-            }
-            
-            if (next) {
-                p = next;
-            } else {
-                break;
-            }
-        }
-    }
-    
-    // 恢复GSM编码
-    a7670e_send_at_cmd("AT+CSCS=\"GSM\"", "OK", response, sizeof(response), AT_CMD_TIMEOUT_MS);
-    
-    // 删除已处理的短信，释放SIM卡存储空间
-    if (processed_count > 0) {
-        ESP_LOGI(TAG, "正在删除 %d 条已处理的短信...", processed_count);
-        for (int i = 0; i < processed_count; i++) {
-            sms_delete(processed_indices[i]);
-        }
-    }
-    
-    ESP_LOGI(TAG, "共读取 %d 条未读短信", count);
-    return count;
-}
-
-bool sms_delete(int index)
+static bool sms_delete(int index)
 {
     char cmd[32];
     char response[128];
