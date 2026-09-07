@@ -13,6 +13,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -22,11 +23,18 @@
 #include "esp_https_ota.h"
 #include "esp_crt_bundle.h"
 #include "esp_app_desc.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include "ota_update.h"
 #include "wifi_smartconfig.h"
+#include "feishu_api.h"
 #include "secrets.h"
 
 static const char *TAG = "OTA";
+
+/* NVS 标记：升级重启前写入，新固件启动后读取并清除 */
+#define OTA_NVS_NAMESPACE "ota"
+#define OTA_NVS_KEY_PENDING "pending"
 
 /* 任务参数 */
 #define OTA_TASK_STACK_SIZE       12288   /* HTTPS/TLS 需要较大栈 */
@@ -140,6 +148,11 @@ static bool find_firmware_url(const char *body, char *url, size_t url_size)
 }
 
 /**
+ * @brief 升级流程结束、重启前写入标记
+ */
+static void mark_ota_reboot_pending(void);
+
+/**
  * @brief 获取最新 Release 的版本号和固件下载地址
  */
 static bool fetch_latest_release(char *tag, size_t tag_size, char *url, size_t url_size)
@@ -238,6 +251,7 @@ static bool ota_check_and_update(void)
         err = esp_https_ota_finish(ota_handle);
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "OTA 升级完成，2 秒后重启切换到新版本...");
+            mark_ota_reboot_pending();   /* 新固件启动后据此发送飞书通知 */
             vTaskDelay(pdMS_TO_TICKS(2000));
             esp_restart();
         }
@@ -247,6 +261,70 @@ static bool ota_check_and_update(void)
         ESP_LOGE(TAG, "OTA 下载数据不完整");
     }
     return false;
+}
+
+/**
+ * @brief 一次性飞书通知任务（大栈承载 HTTPS/TLS，发送后自删除）
+ */
+static void ota_notify_task(void *arg)
+{
+    char *text = (char *)arg;
+    if (feishu_send_text(text)) {
+        ESP_LOGI(TAG, "升级通知已发送到飞书");
+    } else {
+        ESP_LOGE(TAG, "升级通知发送失败");
+    }
+    free(text);
+    vTaskDelete(NULL);
+}
+
+/**
+ * @brief 若设备刚通过 OTA 升级重启，发送飞书通知
+ *
+ * 由主任务在 WiFi 连接成功后调用：读取 NVS 中的升级标记，
+ * 存在则通知"新版本已正常运行"并清除标记
+ */
+void ota_notify_if_just_upgraded(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(OTA_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+
+    uint8_t pending = 0;
+    if (nvs_get_u8(handle, OTA_NVS_KEY_PENDING, &pending) == ESP_OK && pending) {
+        /* 清除标记（先清后通知，即使通知失败也不会重复打扰） */
+        nvs_set_u8(handle, OTA_NVS_KEY_PENDING, 0);
+        nvs_commit(handle);
+        nvs_close(handle);
+
+        char text[96];
+        snprintf(text, sizeof(text),
+                 "🔄 固件已通过 OTA 升级到 v%s 并正常运行",
+                 esp_app_get_description()->version);
+        ESP_LOGI(TAG, "%s", text);
+
+        char *task_text = strdup(text);
+        if (task_text != NULL) {
+            xTaskCreate(ota_notify_task, "ota_notify", 12288, task_text, 3, NULL);
+        }
+        return;
+    }
+
+    nvs_close(handle);
+}
+
+/**
+ * @brief 升级流程结束、重启前写入标记
+ */
+static void mark_ota_reboot_pending(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(OTA_NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_u8(handle, OTA_NVS_KEY_PENDING, 1);
+        nvs_commit(handle);
+        nvs_close(handle);
+    }
 }
 
 /**

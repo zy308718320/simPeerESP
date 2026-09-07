@@ -364,10 +364,11 @@ static void main_task(void *arg)
 
     // 保持任务运行，定期打印状态
     while (1) {
-        // WiFi 连接成功后的初始化（SNTP 时间同步）
+        // WiFi 连接成功后的初始化（SNTP 时间同步、升级通知检查）
         if (s_wifi_just_connected) {
             s_wifi_just_connected = false;
             start_sntp();
+            ota_notify_if_just_upgraded();
         }
 
         vTaskDelay(pdMS_TO_TICKS(10000));
