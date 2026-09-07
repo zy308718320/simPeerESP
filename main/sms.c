@@ -357,13 +357,24 @@ static void parse_cmgr_sms(const char *response, char *phone_number,
         ESP_LOGD(TAG, "引号对%d: [%.*s]", quote_pair, (int)len, q_start);
 
         // 检查是否像电话号码：
-        // 1. 长度 > 0 且 < 32
-        // 2. 以数字或+开头
-        // 3. 不是 "REC UNREAD" / "REC READ" / "STO UNSENT" 等状态字符串
-        if (len > 0 && len < 32) {
-            char first_char = *q_start;
-            if (first_char == '+' || (first_char >= '0' && first_char <= '9')) {
-                // 看起来像电话号码
+        // 1. 长度 >= 3 且 < 32
+        // 2. 内容只含十六进制字符（兼容 UCS2 编码的号码），开头允许 '+'
+        //    （时间戳 "26/09/07,23:06:28+32" 含 / : , 会被此规则排除，
+        //     "REC UNREAD" 等状态串含非十六进制字母同样被排除）
+        if (len >= 3 && len < 32) {
+            bool looks_like_number = true;
+            for (size_t i = 0; i < len; i++) {
+                char c = q_start[i];
+                if (c == '+' && i == 0) {
+                    continue;
+                }
+                if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'))) {
+                    looks_like_number = false;
+                    break;
+                }
+            }
+
+            if (looks_like_number) {
                 strncpy(phone_number, q_start, len);
                 phone_number[len] = '\0';
                 ESP_LOGI(TAG, "解析到电话号码(引号对%d): [%s]", quote_pair, phone_number);
