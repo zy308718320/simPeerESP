@@ -225,8 +225,15 @@ static bool ota_check_and_update(void)
     ESP_LOGI(TAG, "发现新版本，开始 OTA 升级...");
     ESP_LOGI(TAG, "下载地址: %s", url);
 
+    /* github.com 直连不通时通过代理前缀转发下载（可配置，见 secrets.h） */
+    char download_url[320];
+    snprintf(download_url, sizeof(download_url), "%s%s", OTA_DOWNLOAD_PROXY, url);
+    if (strlen(OTA_DOWNLOAD_PROXY) > 0) {
+        ESP_LOGI(TAG, "使用下载代理: %s", OTA_DOWNLOAD_PROXY);
+    }
+
     esp_http_client_config_t http_config = {
-        .url = url,
+        .url = download_url,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = 30000,
         .buffer_size = 2048,
