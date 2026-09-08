@@ -30,11 +30,9 @@
 #include "wifi_smartconfig.h"
 #include "feishu_api.h"
 #include "ota_update.h"
+#include "secrets.h"
 
 static const char *TAG = "MAIN";
-
-/* 备用号码：如果SIM卡未存储号码，则使用此备用号码（可为空） */
-#define FALLBACK_PHONE_NUMBER "[REDACTED]"
 
 /* 短信事件队列长度（队列满时丢弃新事件并记日志） */
 #define SMS_QUEUE_LENGTH 8
