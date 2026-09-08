@@ -104,47 +104,46 @@ static bool json_get_string(const char *body, const char *key, char *out, size_t
 }
 
 /**
- * @brief 在 Release JSON 中查找 sms.bin 资产的下载地址
+ * @brief 在 Release JSON 中查找固件下载地址
  *
- * 遍历所有 "browser_download_url" 字段，取以 /sms.bin 结尾的那个
+ * 每个 Release 只上传一个资产（sms.bin），直接取第一个
+ * "browser_download_url" 字段的值
  */
 static bool find_firmware_url(const char *body, char *url, size_t url_size)
 {
     const char *key = "\"browser_download_url\"";
-    const char *p = body;
-
-    while ((p = strstr(p, key)) != NULL) {
-        const char *v = strchr(p + strlen(key), ':');
-        if (!v) {
-            return false;
-        }
-        v++;
-        while (*v == ' ') {
-            v++;
-        }
-        if (*v != '"') {
-            p += strlen(key);
-            continue;
-        }
-        v++;
-
-        const char *e = strchr(v, '"');
-        if (!e) {
-            return false;
-        }
-
-        size_t len = e - v;
-        if (len > strlen("/sms.bin") && strcmp(v + len - strlen("/sms.bin"), "/sms.bin") == 0) {
-            if (len >= url_size) {
-                return false;
-            }
-            memcpy(url, v, len);
-            url[len] = '\0';
-            return true;
-        }
-        p = e;
+    const char *p = strstr(body, key);
+    if (!p) {
+        return false;
     }
-    return false;
+
+    const char *v = strchr(p + strlen(key), ':');
+    if (!v) {
+        return false;
+    }
+    v++;
+    while (*v == ' ') {
+        v++;
+    }
+    if (*v != '"') {
+        return false;
+    }
+    v++;
+
+    const char *e = strchr(v, '"');
+    if (!e) {
+        return false;
+    }
+
+    size_t len = e - v;
+    if (len == 0 || len >= url_size) {
+        return false;
+    }
+
+    memcpy(url, v, len);
+    url[len] = '\0';
+    ESP_LOGI(TAG, "固件下载地址: %s", url);
+    return true;
 }
 
 /**
@@ -184,6 +183,11 @@ static bool fetch_latest_release(char *tag, size_t tag_size, char *url, size_t u
         ESP_LOGE(TAG, "查询 Release 失败: err=%s, status=%d", esp_err_to_name(err), status);
         return false;
     }
+
+    /* 诊断：打印实际收到的响应长度与内容片段 */
+    ESP_LOGI(TAG, "Release 响应 %d 字节: %.400s", s_manifest_len, s_manifest);
+    const char *asset_mark = strstr(s_manifest, "browser_download_url");
+    ESP_LOGI(TAG, "browser_download_url 字段%s", asset_mark ? "存在" : "缺失（响应被截断？）");
 
     if (!json_get_string(s_manifest, "tag_name", tag, tag_size)) {
         ESP_LOGE(TAG, "Release 信息中未找到 tag_name");
